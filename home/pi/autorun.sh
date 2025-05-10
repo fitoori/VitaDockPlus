@@ -1,58 +1,108 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
 
-# Update udev rules, they tend to not trigger unless doing this on boot.
-sudo udevadm trigger --action=change
+# ───── Constants ────────────────────────────────────────────────────────────────
+LOGFILE="/var/log/vitadock_init.log"
+CONFIG_SCRIPT="/home/pi/getConfig.sh"
+GPIO_SCRIPT="/home/pi/gpioBTDiscovery.py"
+SCREENSAVER_SCRIPT="/home/pi/screensaveron.sh"
+RUN_SCRIPT="/home/pi/run.sh"
+NOTIF_DAEMON="/usr/lib/notification-daemon/notification-daemon"
+REQUIRED_CMDS=(udevadm bluetoothctl pactl python3 dtoverlay)
 
-# Allow on-screen popup notifications.
-/usr/lib/notification-daemon/notification-daemon &
+# ───── Logging ─────────────────────────────────────────────────────────────────
+log() { echo "$(date --iso-8601=seconds) [INFO]  $*" | tee -a "$LOGFILE"; }
+err() { echo "$(date --iso-8601=seconds) [ERROR] $*" | tee -a "$LOGFILE" >&2; }
 
-# Set Bluetooth or AUX audio
-AUDIO_MODE=$(/home/pi/getConfig.sh AUDIO_MODE)
+trap 'err "Failed at line $LINENO (exit code $?)"; exit 1' ERR
 
-if [ "$AUDIO_MODE" == "BT" ]
-then
-    bluetoothctl power on
+# ───── Prep ───────────────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then err "Must run as root"; exit 1; fi
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    command -v "$cmd" >/dev/null || { err "Missing command: $cmd"; exit 1; }
+done
+
+log "Triggering udev rules"
+udevadm trigger --action=change
+
+# ───── Notification Daemon ────────────────────────────────────────────────────
+if pgrep -f "$(basename "$NOTIF_DAEMON")" >/dev/null; then
+    log "Notification daemon already running"
+elif [[ -x "$NOTIF_DAEMON" ]]; then
+    log "Starting notification daemon"
+    "$NOTIF_DAEMON" &>>"$LOGFILE" &
 else
-    AUX_SOURCE=$(/home/pi/getConfig.sh "AUX_SOURCE")
-    AUX_SINK=$(/home/pi/getConfig.sh "AUX_SINK")
-
-    pactl load-module module-loopback source="$AUX_SOURCE" sink="$AUX_SINK"
+    err "Notification daemon not executable"
 fi
 
-# Run GPIO script for menu control in background.
-nohup python /home/pi/gpioBTDiscovery.py &
+# ───── Audio Setup ─────────────────────────────────────────────────────────────
+log "Loading audio mode from config"
+AUDIO_MODE=$("$CONFIG_SCRIPT" AUDIO_MODE)
+case "$AUDIO_MODE" in
+    BT)
+        log "Powering on Bluetooth audio"
+        bluetoothctl power on &>>"$LOGFILE"
+        ;;
+    AUX)
+        AUX_SRC=$("$CONFIG_SCRIPT" AUX_SOURCE)
+        AUX_SNK=$("$CONFIG_SCRIPT" AUX_SINK)
+        [[ -n "$AUX_SRC" && -n "$AUX_SNK" ]] || { err "AUX_SOURCE/AUX_SINK empty"; exit 1; }
+        if pactl list short modules | grep -q "module-loopback source=$AUX_SRC sink=$AUX_SNK"; then
+            log "Loopback already loaded"
+        else
+            log "Loading loopback ($AUX_SRC → $AUX_SNK)"
+            pactl load-module module-loopback source="$AUX_SRC" sink="$AUX_SNK" &>>"$LOGFILE"
+        fi
+        ;;
+    *)
+        err "Invalid AUDIO_MODE: $AUDIO_MODE"
+        exit 1
+        ;;
+esac
 
-# Registers a GPIO pin to act as a keyboard key
-# The GPIO pin to use is read from config.
-#
-# Arguments:
-# $1: Configuration key holding the GPIO pin number
-# $2: The keycode which to trigger
-register_GPIO_key() {
-    local GPIO_CONFIG_KEY="$1"
-    local KEYCODE="$2"
+# ───── GPIO BT Discovery ──────────────────────────────────────────────────────
+if pgrep -f "$(basename "$GPIO_SCRIPT")" >/dev/null; then
+    log "GPIO BT discovery already running"
+else
+    log "Starting GPIO BT discovery"
+    nohup python3 "$GPIO_SCRIPT" >>"$LOGFILE" 2>&1 &
+fi
 
-    local GPIO_KEY=$(/home/pi/getConfig.sh "$GPIO_CONFIG_KEY")
-
-    if [ "$GPIO_KEY" != "" ]
-    then
-        sudo dtoverlay gpio-key gpio="$GPIO_KEY" keycode="$KEYCODE" label="$GPIO_KEY"
-    fi
+# ───── GPIO Key Registration ──────────────────────────────────────────────────
+register_gpio_key() {
+    local key_conf=$1 keycode=$2 gpio=$("$CONFIG_SCRIPT" "$key_conf")
+    [[ -n "$gpio" ]] || { log "No $key_conf"; return; }
+    log "Registering GPIO $gpio → keycode $keycode"
+    dtoverlay gpio-key gpio="$gpio" keycode="$keycode" label="GPIO${gpio}" &>>"$LOGFILE"
 }
 
-register_GPIO_key "LEFT_KEY_GPIO" "105"
-register_GPIO_key "RIGHT_KEY_GPIO" "106"
-register_GPIO_key "UP_KEY_GPIO" "103"
-register_GPIO_key "DOWN_KEY_GPIO" "108"
-register_GPIO_key "WINDOWS_KEY_GPIO" "125"
-register_GPIO_key "ESCAPE_KEY_GPIO" "1"
-register_GPIO_key "ENTER_KEY_GPIO" "28"
-register_GPIO_key "TAB_KEY_GPIO" "15"
+declare -A KEY_MAP=(
+    [LEFT_KEY_GPIO]=105 [RIGHT_KEY_GPIO]=106
+    [UP_KEY_GPIO]=103   [DOWN_KEY_GPIO]=108
+    [WINDOWS_KEY_GPIO]=125 [ESCAPE_KEY_GPIO]=1
+    [ENTER_KEY_GPIO]=28 [TAB_KEY_GPIO]=15
+)
+for k in "${!KEY_MAP[@]}"; do
+    register_gpio_key "$k" "${KEY_MAP[$k]}"
+done
 
-# Turn on the screensaver.
-bash /home/pi/screensaveron.sh &
+# ───── Screensaver ────────────────────────────────────────────────────────────
+if pgrep -f "$(basename "$SCREENSAVER_SCRIPT")" >/dev/null; then
+    log "Screensaver already active"
+elif [[ -x "$SCREENSAVER_SCRIPT" ]]; then
+    log "Enabling screensaver"
+    bash "$SCREENSAVER_SCRIPT" &>>"$LOGFILE" &
+else
+    err "Screensaver script missing or not executable"
+fi
 
-# Attempt to run a viewer in case Vita is already plugged in during boot and if not
-# turn on the screensaver again since run.sh disables it before erroring out.
-# Disabled for now because the viewer spawned at boot has screen tearing.
-# bash /home/pi/run.sh || bash /home/pi/screensaveron.sh &
+# ───── Viewer (disabled: screen-tearing) ────────────────────────────────────────
+# if bash "$RUN_SCRIPT"; then
+#     log "Viewer launched"
+# else
+#     log "Viewer failed; re-enabling screensaver"
+#     bash "$SCREENSAVER_SCRIPT" &>>"$LOGFILE" &
+# fi
+
+log "VitaDock+ init complete"
